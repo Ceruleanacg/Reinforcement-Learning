@@ -1,99 +1,85 @@
 import numpy as np
 import pandas as pd
-import time
 
-np.random.seed(2)  # reproducible
-
-
-N_STATES = 6   # the length of the 1 dimensional world
-ACTIONS = ['left', 'right']     # available actions
-EPSILON = 0.9   # greedy police
-ALPHA = 0.1     # learning rate
-GAMMA = 0.9    # discount factor
-MAX_EPISODES = 13   # maximum episodes
-FRESH_TIME = 0.3    # fresh time for one move
+from base.maze import Maze
 
 
-def build_q_table(n_states, actions):
-    table = pd.DataFrame(
-        np.zeros((n_states, len(actions))),     # q_table initial values
-        columns=actions,    # actions's name
-    )
-    # print(table)    # show table
-    return table
+class QLearningTable:
+    def __init__(self, actions, learning_rate=0.01, reward_decay=0.9, e_greedy=0.9):
+        self.actions = actions  # a list
+        self.lr = learning_rate
+        self.gamma = reward_decay
+        self.epsilon = e_greedy
+        self.q_table = pd.DataFrame(columns=self.actions, dtype=np.float64)
 
-
-def choose_action(state, q_table):
-    # This is how to choose an action
-    state_actions = q_table.iloc[state, :]
-    if (np.random.uniform() > EPSILON) or (state_actions.all() == 0):  # act non-greedy or state-action have no value
-        action_name = np.random.choice(ACTIONS)
-    else:   # act greedy
-        action_name = state_actions.idxmax()    # replace argmax to idxmax as argmax means a different function in newer version of pandas
-    return action_name
-
-
-def get_env_feedback(S, A):
-    # This is how agent will interact with the environment
-    if A == 'right':    # move right
-        if S == N_STATES - 2:   # terminate
-            S_ = 'terminal'
-            R = 1
+    def choose_action(self, observation):
+        self.check_state_exist(observation)
+        # action selection
+        if np.random.uniform() < self.epsilon:
+            # choose best action
+            state_action = self.q_table.loc[observation, :]
+            state_action = state_action.reindex(np.random.permutation(state_action.index))     # some actions have same value
+            action = state_action.idxmax()
         else:
-            S_ = S + 1
-            R = 0
-    else:   # move left
-        R = 0
-        if S == 0:
-            S_ = S  # reach the wall
+            # choose random action
+            action = np.random.choice(self.actions)
+        return action
+
+    def learn(self, s, a, r, s_):
+        self.check_state_exist(s_)
+        q_predict = self.q_table.loc[s, a]
+        if s_ != 'terminal':
+            q_target = r + self.gamma * self.q_table.loc[s_, :].max()  # next state is not terminal
         else:
-            S_ = S - 1
-    return S_, R
+            q_target = r  # next state is terminal
+        self.q_table.loc[s, a] += self.lr * (q_target - q_predict)  # update
+
+    def check_state_exist(self, state):
+        if state not in self.q_table.index:
+            # append new state to q table
+            self.q_table = self.q_table.append(
+                pd.Series(
+                    [0]*len(self.actions),
+                    index=self.q_table.columns,
+                    name=state,
+                )
+            )
 
 
-def update_env(S, episode, step_counter):
-    # This is how environment be updated
-    env_list = ['-']*(N_STATES-1) + ['T']   # '---------T' our environment
-    if S == 'terminal':
-        interaction = 'Episode %s: total_steps = %s' % (episode+1, step_counter)
-        print('\r{}'.format(interaction), end='')
-        time.sleep(2)
-        print('\r                                ', end='')
-    else:
-        env_list[S] = 'o'
-        interaction = ''.join(env_list)
-        print('\r{}'.format(interaction), end='')
-        time.sleep(FRESH_TIME)
+def update():
+    for episode in range(100):
+        print('Episode: {}'.format(episode))
+        # initial observation
+        observation = env.reset()
 
+        while True:
+            # fresh env
+            env.render()
 
-def rl():
-    # main part of RL loop
-    q_table = build_q_table(N_STATES, ACTIONS)
-    for episode in range(MAX_EPISODES):
-        step_counter = 0
-        S = 0
-        is_terminated = False
-        update_env(S, episode, step_counter)
-        while not is_terminated:
+            # RL choose action based on observation
+            action = RL.choose_action(str(observation))
 
-            A = choose_action(S, q_table)
-            S_, R = get_env_feedback(S, A)  # take action & get next state and reward
-            q_predict = q_table.loc[S, A]
-            if S_ != 'terminal':
-                q_target = R + GAMMA * q_table.iloc[S_, :].max()   # next state is not terminal
-            else:
-                q_target = R     # next state is terminal
-                is_terminated = True    # terminate this episode
+            # RL take action and get next observation and reward
+            observation_, reward, done = env.step(action)
 
-            q_table.loc[S, A] += ALPHA * (q_target - q_predict)  # update
-            S = S_  # move to next state
+            # RL learn from this transition
+            RL.learn(str(observation), action, reward, str(observation_))
 
-            update_env(S, episode, step_counter+1)
-            step_counter += 1
-    return q_table
+            # swap observation
+            observation = observation_
+
+            # break while loop when end of this episode
+            if done:
+                break
+
+    # end of game
+    print('game over')
+    env.destroy()
 
 
 if __name__ == "__main__":
-    q_table = rl()
-    print('\r\nQ-table:\n')
-    print(q_table)
+    env = Maze()
+    RL = QLearningTable(actions=list(range(env.n_actions)))
+
+    env.after(100, update)
+    env.mainloop()

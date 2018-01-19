@@ -2,102 +2,65 @@
 
 import pandas as pd
 import numpy as np
-import logging
-import time
 
-logging.basicConfig(level=logging.INFO)
-
-np.random.seed(2)
+from base.maze import Maze
 
 
 class QLearning(object):
-    def __init__(self, state_count, actions, epsilon=0.9, alpha=0.1, gamma=0.9, max_episodes=20):
-
-        self.state_count = state_count
+    def __init__(self, actions, env, alpha=0.01, gamma=0.9, epsilon=0.9):
         self.actions = actions
-        self.epsilon = epsilon
+        self.env = env
         self.alpha = alpha
         self.gamma = gamma
-        self.max_episodes = max_episodes
-        self.current_state = 0
-        self.current_episode = 0
-        self.current_steps = 0
+        self.epsilon = epsilon
+        self.q_table = pd.DataFrame(columns=self.actions, dtype=np.float64)
 
-        self._init_q_table()
-
-    def _init_q_table(self):
-        self.q_table = pd.DataFrame(np.zeros((self.state_count, len(self.actions))), columns=self.actions)
-
-    def get_action(self):
-        target_actions = self.q_table.iloc[self.current_state, :]
-        if np.random.uniform() > self.epsilon or target_actions.all() == 0:
-            target_action = np.random.choice(self.actions)
-        else:
+    def get_action(self, state):
+        self.check_if_state_exist(state)
+        if np.random.uniform() < self.epsilon:
+            target_actions = self.q_table.loc[state, :]
+            target_actions = target_actions.reindex(np.random.permutation(target_actions.index))
             target_action = target_actions.idxmax()
+        else:
+            target_action = np.random.choice(self.actions)
         return target_action
 
-    def get_next_state(self, action):
-        if action == 'right':
-            if self.current_state + 2 == self.state_count:
-                state_next = 'episode_done'
-                reward = 1
-            else:
-                state_next = self.current_state + 1
-                reward = 0
+    def update_q_value(self, state, action, reward, state_next):
+        self.check_if_state_exist(state_next)
+        q_value_predict = self.q_table.loc[state, action]
+        if state_next != 'done':
+            q_value_target = reward + self.gamma * self.q_table.loc[state_next, :].max()
         else:
-            reward = -1
-            if self.current_state == 0:
-                state_next = 0
-            else:
-                state_next = self.current_state - 1
-        return state_next, reward
+            q_value_target = reward
+        self.q_table.loc[state, action] += self.alpha * (q_value_target - q_value_predict)
 
-    def update_env(self):
-        env = ['-'] * (self.state_count - 1) + ['💰']
-        if self.current_state == 'episode_done':
-            logging.info("Episode %s, total steps = %s" % (self.current_episode, self.current_steps))
-            logging.info("\r{}".format(self.q_table))
-            time.sleep(1.5)
-        else:
-            env[self.current_state] = '👶'
-            logging.info("".join(env))
-            time.sleep(0.3)
+    def check_if_state_exist(self, state):
+        if state not in self.q_table.index:
+            self.q_table = self.q_table.append(
+                pd.Series(
+                    [0] * len(self.actions),
+                    index=self.q_table.columns,
+                    name=state
+                )
+            )
 
     def train(self):
-        for episode in range(self.max_episodes):
-
-            self.current_state = 0
-            self.current_steps = 0
-
-            self.update_env()
-
+        for episode in range(100):
+            print('Episode: {}'.format(episode))
+            state = self.env.reset()
             while True:
-
-                action = self.get_action()
-                state_next, reward = self.get_next_state(action)
-
-                q_value_predict = self.q_table.loc[self.current_state, action]
-
-                if state_next == 'episode_done':
-                    episode_done = True
-                else:
-                    episode_done = False
-
-                if not episode_done:
-                    q_value_target = reward + self.gamma * self.q_table.iloc[state_next, :].max()
-                else:
-                    q_value_target = reward
-
-                self.q_table.loc[self.current_state, action] += self.alpha * (q_value_target - q_value_predict)
-                self.current_state = state_next
-                self.current_steps += 1
-
-                self.update_env()
-
-                if episode_done:
+                self.env.render()
+                action = self.get_action(str(state))
+                state_next, reward, done = self.env.step(action)
+                self.update_q_value(str(state), action, reward, str(state_next))
+                state = state_next
+                if done:
                     break
+        self.env.destroy()
 
 
 if __name__ == '__main__':
-    model = QLearning(6, ['left', 'right'])
-    model.train()
+    env = Maze()
+    model = QLearning(list(range(env.n_actions)), env)
+    env.after(100, model.train)
+    env.mainloop()
