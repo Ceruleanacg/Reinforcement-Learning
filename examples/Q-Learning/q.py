@@ -29,10 +29,10 @@ class QLearning(object):
         self.check_if_state_exist(state_next)
         q_value_predict = self.q_table.loc[state, action]
         if state_next != 'done':
-            q_value_target = reward + self.gamma * self.q_table.loc[state_next, :].max()
+            q_value_real = reward + self.gamma * self.q_table.loc[state_next, :].max()
         else:
-            q_value_target = reward
-        self.q_table.loc[state, action] += self.alpha * (q_value_target - q_value_predict)
+            q_value_real = reward
+        self.q_table.loc[state, action] += self.alpha * (q_value_real - q_value_predict)
 
     def check_if_state_exist(self, state):
         if state not in self.q_table.index:
@@ -50,9 +50,16 @@ class QLearning(object):
             state = self.env.reset()
             while True:
                 self.env.render()
+
+                # Get next action.
                 action = self.get_action(str(state))
+
+                # Get next state.
                 state_next, reward, done = self.env.step(action)
+
+                # Update Q table.
                 self.update_q_value(str(state), action, reward, str(state_next))
+
                 state = state_next
                 if done:
                     break
