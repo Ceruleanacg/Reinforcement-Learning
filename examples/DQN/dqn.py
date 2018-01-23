@@ -74,8 +74,8 @@ class DQN(object):
         # Input state, state_next, reward, action.
         self.state = tf.placeholder(tf.float32, [None, self.state_dim], name='input_state')
         self.state_next = tf.placeholder(tf.float32, [None, self.state_dim], name='input_state_next')
-        self.reward = tf.placeholder(tf.float32, [None, 1], name='input_reward')
-        self.action = tf.placeholder(tf.int32, [None, 1], name='input_action')
+        self.reward = tf.placeholder(tf.float32, [None, ], name='input_reward')
+        self.action = tf.placeholder(tf.int32, [None, ], name='input_action')
 
     def _init_nn(self):
 
@@ -115,16 +115,14 @@ class DQN(object):
     def _init_ops(self):
         with tf.variable_scope('q_real'):
             # size of q_value_real is [BATCH_SIZE, 1]
-            q_value_max = tf.reshape(tf.reduce_max(self.q_values_target, axis=1), [self.batch_size, 1])
+            q_value_max = tf.reduce_max(self.q_values_target, axis=1)
             q_value_real = self.reward + self.gamma * q_value_max
             self.q_value_real = tf.stop_gradient(q_value_real)
 
         with tf.variable_scope('q_predict'):
             # size of q_value_predict is [BATCH_SIZE, 1]
-            action_rows = tf.reshape(tf.range(self.batch_size, dtype=tf.int32), [self.batch_size, 1])
-            action_indices = tf.reshape(tf.stack([action_rows, self.action], axis=1), [self.batch_size, 2])
-            q_value_predict = tf.reshape(tf.gather_nd(self.q_values_predict, action_indices), [self.batch_size, 1])
-            self.q_value_predict = q_value_predict
+            action_indices = tf.stack([tf.range(tf.shape(self.action)[0], dtype=tf.int32), self.action], axis=1)
+            self.q_value_predict = tf.gather_nd(self.q_values_predict, action_indices)
 
         with tf.variable_scope('loss'):
             self.loss = tf.reduce_mean(tf.squared_difference(self.q_value_real, self.q_value_predict, name='mse'))
@@ -134,9 +132,9 @@ class DQN(object):
 
         with tf.variable_scope('update_target_net'):
             t_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_q_net')
-            e_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='evaluate_q_net')
+            p_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='predict_q_net')
 
-            self.update_q_net = [tf.assign(t, e) for t, e in zip(t_params, e_params)]
+            self.update_q_net = [tf.assign(t, e) for t, e in zip(t_params, p_params)]
 
     def _init_session(self):
         self.session = tf.Session()
@@ -153,7 +151,7 @@ class DQN(object):
     def get_next_action(self, state):
         state = state[np.newaxis, :]
         if np.random.uniform() < self.epsilon:
-            target_action = np.argmax(self.session.run(self.q_value_predict, feed_dict={self.state: state}))
+            target_action = np.argmax(self.session.run(self.q_values_predict, feed_dict={self.state: state}))
         else:
             target_action = np.random.randint(0, self.action_dim)
         return target_action
@@ -166,6 +164,7 @@ class DQN(object):
             state = self.env.reset()
 
             while True:
+
                 self.env.render()
 
                 action = self.get_next_action(state)
@@ -186,18 +185,18 @@ class DQN(object):
 
                     batch = self.buffer[sample_indices, :]
 
-                    s = batch[:, :self.state_dim]
-                    a = np.reshape(batch[:, self.state_dim], (self.batch_size, 1))
-                    r = np.reshape(batch[:, self.state_dim + 1], (self.batch_size, 1))
-                    s_n = batch[:, -self.state_dim:]
+                    batch_s = batch[:, :self.state_dim]
+                    batch_a = batch[:, self.state_dim]
+                    batch_r = batch[:, self.state_dim + 1]
+                    batch_s_n = batch[:, -self.state_dim:]
 
                     _, cost = self.session.run(
                         [self.train_op, self.loss],
                         feed_dict={
-                            self.state: s,
-                            self.action: a,
-                            self.reward: r,
-                            self.state_next: s_n
+                            self.state: batch_s,
+                            self.action: batch_a,
+                            self.reward: batch_r,
+                            self.state_next: batch_s_n
                         }
                     )
 
