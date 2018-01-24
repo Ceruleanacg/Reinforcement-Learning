@@ -57,12 +57,12 @@ class DoubleDQN(object):
 
         w_initializer, b_initializer = tf.random_normal_initializer(0.0, 0.3), tf.constant_initializer(0.1)
 
-        self.q_values_target_op = self.__build_layers(self.state_next, 20, w_initializer, b_initializer, "target_qn")
-        self.q_values_predict_op = self.__build_layers(self.state, 20, w_initializer, b_initializer, "predict_qn")
+        self.q_values_target = self.__build_layers(self.state_next, 20, w_initializer, b_initializer, "target_qn")
+        self.q_values_predict = self.__build_layers(self.state, 20, w_initializer, b_initializer, "predict_qn")
 
     def _init_op(self):
         with tf.variable_scope('loss'):
-            self.loss = tf.reduce_mean(tf.squared_difference(self.q_target, self.q_values_predict_op))
+            self.loss = tf.reduce_mean(tf.squared_difference(self.q_target, self.q_values_predict))
         with tf.variable_scope('train'):
             self.train_op = tf.train.RMSPropOptimizer(self.learning_rate).minimize(self.loss)
         with tf.variable_scope('update_target_q_net'):
@@ -84,7 +84,6 @@ class DoubleDQN(object):
 
             q_values = tf.layers.dense(phi_state,
                                        self.action_dim,
-                                       activation=tf.nn.relu,
                                        kernel_initializer=w_initializer,
                                        bias_initializer=b_initializer)
             return q_values
@@ -98,7 +97,7 @@ class DoubleDQN(object):
     def get_next_action(self, state):
         if np.random.uniform() < self.epsilon:
             # Calculate Q-values Predict.
-            q_predict = self.session.run(self.q_values_predict_op, feed_dict={self.state: state[np.newaxis, :]})
+            q_predict = self.session.run(self.q_values_predict, feed_dict={self.state: state[np.newaxis, :]})
             # Get target action form max(Q-values)
             target_action = np.argmax(q_predict)
             # Update Q-running.
@@ -124,28 +123,30 @@ class DoubleDQN(object):
         # 1. Update target Q-network if need.
         self.update_target_q_net_if_need()
 
-        # 2. Get batch sample.
+        # 2. Get batch sample and batch indices.
         batch = self.get_sample_batch()
+        action = batch[:, self.state_dim].astype(int)
         state = batch[:, :self.state_dim]
         state_next = batch[:, -self.state_dim:]
         reward = batch[:, self.state_dim + 1]
 
-        # 3. Calculate Q-target (s') and Q-predict (s') and Q-predict (s).
-        q_target_next = self.session.run(self.q_values_target_op, feed_dict={self.state_next: state_next})
-        q_predict_next = self.session.run(self.q_values_predict_op, feed_dict={self.state: state_next})
-        q_predict = self.session.run(self.q_values_predict_op, feed_dict={self.state: state})
-        q_target = q_predict.copy()
+        # 3-1. Calculate Q-predict (s')
+        q_predict_next = self.session.run(self.q_values_predict, feed_dict={self.state: state_next})
 
-        # 4. Create indices.
+        # 3-2. Get argmax action indices, for Q-predict (s') and create batch indices.
+        argmax_actions_indices = np.argmax(q_predict_next, axis=1)
         batch_indices = np.arange(self.batch_size, dtype=np.int32)
-        action_indices = batch[:, self.state_dim].astype(int)
 
-        # 5. Calculate y_i.
-        best_actions_q_predict_next = np.argmax(q_predict_next, axis=1)
-        best_q_target = q_target_next[batch_indices, best_actions_q_predict_next]
-        q_target[batch_indices, action_indices] = reward + self.gamma * best_q_target
+        # 3-3. Calculate Q-target (s', max_a)
+        q_target_next = self.session.run(self.q_values_target, feed_dict={self.state_next: state_next})
+        q_target_next_max_a = q_target_next[batch_indices, argmax_actions_indices]
 
-        # 6. Calculate loss.
+        # 3-4. Calculate y_i
+        q_predict = self.session.run(self.q_values_predict, feed_dict={self.state: state})
+        q_target = q_predict.copy()
+        q_target[batch_indices, action] = reward + self.gamma * q_target_next_max_a
+
+        # 6. Calculate loss by calculate Q-predict (s, a).
         _, loss = self.session.run([self.train_op, self.loss], feed_dict={self.state: state, self.q_target: q_target})
 
         # 7. Logs.
