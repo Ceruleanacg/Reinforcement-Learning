@@ -157,11 +157,13 @@ class DoubleDQN(object):
 
 
 ACTION_DIM, STATE_DIM = 11, 3
+# ACTION_DIM, STATE_DIM = 3, 2
 
 
 def main(_):
 
     env = gym.make('Pendulum-v0')
+    # env = gym.make('MountainCar-v0')
     env = env.unwrapped
     env.seed(2)
 
