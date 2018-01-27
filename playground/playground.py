@@ -266,6 +266,8 @@ class DQNPrioritizedReplay:
                                          feed_dict={self.s: batch_memory[:, :self.n_features],
                                                     self.q_target: q_target})
 
+        print('Steps: {} | The cost is: {}'.format(self.learn_step_counter, self.cost))
+
         self.cost_his.append(self.cost)
 
         self.epsilon = self.epsilon + self.epsilon_increment if self.epsilon < self.epsilon_max else self.epsilon_max
@@ -300,7 +302,8 @@ def train(RL):
         observation = env.reset()
         while True:
 
-            env.render()
+            if total_steps > MEMORY_SIZE:
+                env.render()
 
             action = RL.choose_action(observation)
 
