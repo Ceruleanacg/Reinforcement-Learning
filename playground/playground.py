@@ -3,221 +3,163 @@ import tensorflow as tf
 import gym
 import matplotlib.pyplot as plt
 
-
+# reproducible
 np.random.seed(1)
 tf.set_random_seed(1)
 
 
-class DuelingDQN:
+class PolicyGradient:
     def __init__(
             self,
             n_actions,
             n_features,
-            learning_rate=0.001,
-            reward_decay=0.9,
-            e_greedy=0.9,
-            replace_target_iter=200,
-            memory_size=500,
-            batch_size=32,
-            e_greedy_increment=None,
+            learning_rate=0.01,
+            reward_decay=0.95,
             output_graph=False,
-            dueling=True,
-            sess=None,
     ):
         self.n_actions = n_actions
         self.n_features = n_features
         self.lr = learning_rate
         self.gamma = reward_decay
-        self.epsilon_max = e_greedy
-        self.replace_target_iter = replace_target_iter
-        self.memory_size = memory_size
-        self.batch_size = batch_size
-        self.epsilon_increment = e_greedy_increment
-        self.epsilon = 0 if e_greedy_increment is not None else self.epsilon_max
 
-        self.dueling = dueling      # decide to use dueling DQN or not
+        self.ep_obs, self.ep_as, self.ep_rs = [], [], []
 
-        self.learn_step_counter = 0
-        self.memory = np.zeros((self.memory_size, n_features*2+2))
         self._build_net()
-        t_params = tf.get_collection('target_net_params')
-        e_params = tf.get_collection('eval_net_params')
-        self.replace_target_op = [tf.assign(t, e) for t, e in zip(t_params, e_params)]
 
-        if sess is None:
-            self.sess = tf.Session()
-            self.sess.run(tf.global_variables_initializer())
-        else:
-            self.sess = sess
+        self.sess = tf.Session()
+
         if output_graph:
+            # $ tensorboard --logdir=logs
+            # http://0.0.0.0:6006/
+            # tf.train.SummaryWriter soon be deprecated, use following
             tf.summary.FileWriter("logs/", self.sess.graph)
-        self.cost_his = []
+
+        self.sess.run(tf.global_variables_initializer())
 
     def _build_net(self):
-        def build_layers(s, c_names, n_l1, w_initializer, b_initializer):
-            with tf.variable_scope('l1'):
-                w1 = tf.get_variable('w1', [self.n_features, n_l1], initializer=w_initializer, collections=c_names)
-                b1 = tf.get_variable('b1', [1, n_l1], initializer=b_initializer, collections=c_names)
-                l1 = tf.nn.relu(tf.matmul(s, w1) + b1)
+        with tf.name_scope('inputs'):
+            self.tf_obs = tf.placeholder(tf.float32, [None, self.n_features], name="observations")
+            self.tf_acts = tf.placeholder(tf.int32, [None, ], name="actions_num")
+            self.tf_vt = tf.placeholder(tf.float32, [None, ], name="actions_value")
+        # fc1
+        layer = tf.layers.dense(
+            inputs=self.tf_obs,
+            units=10,
+            activation=tf.nn.tanh,  # tanh activation
+            kernel_initializer=tf.random_normal_initializer(mean=0, stddev=0.3),
+            bias_initializer=tf.constant_initializer(0.1),
+            name='fc1'
+        )
+        # fc2
+        all_act = tf.layers.dense(
+            inputs=layer,
+            units=self.n_actions,
+            activation=None,
+            kernel_initializer=tf.random_normal_initializer(mean=0, stddev=0.3),
+            bias_initializer=tf.constant_initializer(0.1),
+            name='fc2'
+        )
 
-            if self.dueling:
-                # Dueling DQN
-                with tf.variable_scope('Value'):
-                    w2 = tf.get_variable('w2', [n_l1, 1], initializer=w_initializer, collections=c_names)
-                    b2 = tf.get_variable('b2', [1, 1], initializer=b_initializer, collections=c_names)
-                    self.V = tf.matmul(l1, w2) + b2
+        self.all_act_prob = tf.nn.softmax(all_act, name='act_prob')  # use softmax to convert to probability
 
-                with tf.variable_scope('Advantage'):
-                    w2 = tf.get_variable('w2', [n_l1, self.n_actions], initializer=w_initializer, collections=c_names)
-                    b2 = tf.get_variable('b2', [1, self.n_actions], initializer=b_initializer, collections=c_names)
-                    self.A = tf.matmul(l1, w2) + b2
+        with tf.name_scope('loss'):
+            # to maximize total reward (log_p * R) is to minimize -(log_p * R), and the tf only have minimize(loss)
+            neg_log_prob = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=all_act, labels=self.tf_acts)   # this is negative log of chosen action
+            # or in this way:
+            # neg_log_prob = tf.reduce_sum(-tf.log(self.all_act_prob)*tf.one_hot(self.tf_acts, self.n_actions), axis=1)
+            loss = tf.reduce_mean(neg_log_prob * self.tf_vt)  # reward guided loss
 
-                with tf.variable_scope('Q'):
-                    out = self.V + (self.A - tf.reduce_mean(self.A, axis=1, keep_dims=True))     # Q = V(s) + A(s,a)
-            else:
-                with tf.variable_scope('Q'):
-                    w2 = tf.get_variable('w2', [n_l1, self.n_actions], initializer=w_initializer, collections=c_names)
-                    b2 = tf.get_variable('b2', [1, self.n_actions], initializer=b_initializer, collections=c_names)
-                    out = tf.matmul(l1, w2) + b2
-
-            return out
-
-        # ------------------ build evaluate_net ------------------
-        self.s = tf.placeholder(tf.float32, [None, self.n_features], name='s')  # input
-        self.q_target = tf.placeholder(tf.float32, [None, self.n_actions], name='Q_target')  # for calculating loss
-        with tf.variable_scope('eval_net'):
-            c_names, n_l1, w_initializer, b_initializer = \
-                ['eval_net_params', tf.GraphKeys.GLOBAL_VARIABLES], 20, \
-                tf.random_normal_initializer(0., 0.3), tf.constant_initializer(0.1)  # config of layers
-
-            self.q_eval = build_layers(self.s, c_names, n_l1, w_initializer, b_initializer)
-
-        with tf.variable_scope('loss'):
-            self.loss = tf.reduce_mean(tf.squared_difference(self.q_target, self.q_eval))
-        with tf.variable_scope('train'):
-            self._train_op = tf.train.RMSPropOptimizer(self.lr).minimize(self.loss)
-
-        # ------------------ build target_net ------------------
-        self.s_ = tf.placeholder(tf.float32, [None, self.n_features], name='s_')    # input
-        with tf.variable_scope('target_net'):
-            c_names = ['target_net_params', tf.GraphKeys.GLOBAL_VARIABLES]
-
-            self.q_next = build_layers(self.s_, c_names, n_l1, w_initializer, b_initializer)
-
-    def store_transition(self, s, a, r, s_):
-        if not hasattr(self, 'memory_counter'):
-            self.memory_counter = 0
-        transition = np.hstack((s, [a, r], s_))
-        index = self.memory_counter % self.memory_size
-        self.memory[index, :] = transition
-        self.memory_counter += 1
+        with tf.name_scope('train'):
+            self.train_op = tf.train.AdamOptimizer(self.lr).minimize(loss)
 
     def choose_action(self, observation):
-        observation = observation[np.newaxis, :]
-        if np.random.uniform() < self.epsilon:  # choosing action
-            actions_value = self.sess.run(self.q_eval, feed_dict={self.s: observation})
-            action = np.argmax(actions_value)
-        else:
-            action = np.random.randint(0, self.n_actions)
+        prob_weights = self.sess.run(self.all_act_prob, feed_dict={self.tf_obs: observation[np.newaxis, :]})
+        action = np.random.choice(range(prob_weights.shape[1]), p=prob_weights.ravel())  # select action w.r.t the actions prob
         return action
 
+    def store_transition(self, s, a, r):
+        self.ep_obs.append(s)
+        self.ep_as.append(a)
+        self.ep_rs.append(r)
+
     def learn(self):
-        if self.learn_step_counter % self.replace_target_iter == 0:
-            self.sess.run(self.replace_target_op)
-            print('\ntarget_params_replaced\n')
+        # discount and normalize episode reward
+        discounted_ep_rs_norm = self._discount_and_norm_rewards()
 
-        sample_index = np.random.choice(self.memory_size, size=self.batch_size)
-        batch_memory = self.memory[sample_index, :]
+        # train on episode
+        self.sess.run(self.train_op, feed_dict={
+             self.tf_obs: np.vstack(self.ep_obs),  # shape=[None, n_obs]
+             self.tf_acts: np.array(self.ep_as),  # shape=[None, ]
+             self.tf_vt: discounted_ep_rs_norm,  # shape=[None, ]
+        })
 
-        q_next = self.sess.run(self.q_next, feed_dict={self.s_: batch_memory[:, -self.n_features:]}) # next observation
-        q_eval = self.sess.run(self.q_eval, {self.s: batch_memory[:, :self.n_features]})
+        self.ep_obs, self.ep_as, self.ep_rs = [], [], []    # empty episode data
+        return discounted_ep_rs_norm
 
-        q_target = q_eval.copy()
+    def _discount_and_norm_rewards(self):
+        # discount episode rewards
+        discounted_ep_rs = np.zeros_like(self.ep_rs)
+        running_add = 0
+        for t in reversed(range(0, len(self.ep_rs))):
+            running_add = running_add * self.gamma + self.ep_rs[t]
+            discounted_ep_rs[t] = running_add
 
-        batch_index = np.arange(self.batch_size, dtype=np.int32)
-        eval_act_index = batch_memory[:, self.n_features].astype(int)
-        reward = batch_memory[:, self.n_features + 1]
-
-        q_target[batch_index, eval_act_index] = reward + self.gamma * np.max(q_next, axis=1)
-
-        _, self.cost = self.sess.run([self._train_op, self.loss],
-                                     feed_dict={self.s: batch_memory[:, :self.n_features],
-                                                self.q_target: q_target})
-
-        if self.learn_step_counter % 1000 == 0:
-            print('Train Steps: {} | Loss is {}'.format(self.learn_step_counter, self.cost))
-
-        self.cost_his.append(self.cost)
-
-        self.epsilon = self.epsilon + self.epsilon_increment if self.epsilon < self.epsilon_max else self.epsilon_max
-        self.learn_step_counter += 1
+        # normalize episode rewards
+        discounted_ep_rs -= np.mean(discounted_ep_rs)
+        discounted_ep_rs /= np.std(discounted_ep_rs)
+        return discounted_ep_rs
 
 
+DISPLAY_REWARD_THRESHOLD = 400  # renders environment if total episode reward is greater then this threshold
+RENDER = False  # rendering wastes time
 
-env = gym.make('Pendulum-v0')
+env = gym.make('CartPole-v0')
+env.seed(1)     # reproducible, general Policy gradient has high variance
 env = env.unwrapped
-env.seed(1)
-MEMORY_SIZE = 3000
-ACTION_SPACE = 25
 
-sess = tf.Session()
-with tf.variable_scope('natural'):
-    natural_DQN = DuelingDQN(
-        n_actions=ACTION_SPACE, n_features=3, memory_size=MEMORY_SIZE,
-        e_greedy_increment=0.001, sess=sess, dueling=False)
+print(env.action_space)
+print(env.observation_space)
+print(env.observation_space.high)
+print(env.observation_space.low)
 
-with tf.variable_scope('dueling'):
-    dueling_DQN = DuelingDQN(
-        n_actions=ACTION_SPACE, n_features=3, memory_size=MEMORY_SIZE,
-        e_greedy_increment=0.001, sess=sess, dueling=True, output_graph=True)
+RL = PolicyGradient(
+    n_actions=env.action_space.n,
+    n_features=env.observation_space.shape[0],
+    learning_rate=0.02,
+    reward_decay=0.99,
+    # output_graph=True,
+)
 
-sess.run(tf.global_variables_initializer())
+for i_episode in range(3000):
 
-
-def train(RL):
-    acc_r = [0]
-    total_steps = 0
     observation = env.reset()
+
     while True:
-        if total_steps-MEMORY_SIZE > 9000: env.render()
+        if RENDER: env.render()
 
         action = RL.choose_action(observation)
 
-        f_action = (action-(ACTION_SPACE-1)/2)/((ACTION_SPACE-1)/4)   # [-2 ~ 2] float actions
-        observation_, reward, done, info = env.step(np.array([f_action]))
+        observation_, reward, done, info = env.step(action)
 
-        reward /= 10      # normalize to a range of (-1, 0)
-        acc_r.append(reward + acc_r[-1])  # accumulated reward
+        RL.store_transition(observation, action, reward)
 
-        RL.store_transition(observation, action, reward, observation_)
+        if done:
+            ep_rs_sum = sum(RL.ep_rs)
 
-        if total_steps > MEMORY_SIZE:
-            RL.learn()
+            if 'running_reward' not in globals():
+                running_reward = ep_rs_sum
+            else:
+                running_reward = running_reward * 0.99 + ep_rs_sum * 0.01
+            if running_reward > DISPLAY_REWARD_THRESHOLD: RENDER = True     # rendering
+            print("episode:", i_episode, "  reward:", int(running_reward))
 
-        if total_steps-MEMORY_SIZE > 15000:
+            vt = RL.learn()
+
+            if i_episode == 0:
+                plt.plot(vt)    # plot the episode vt
+                plt.xlabel('episode steps')
+                plt.ylabel('normalized state-action value')
+                plt.show()
             break
 
         observation = observation_
-        total_steps += 1
-    return RL.cost_his, acc_r
-
-c_natural, r_natural = train(natural_DQN)
-c_dueling, r_dueling = train(dueling_DQN)
-
-plt.figure(1)
-plt.plot(np.array(c_natural), c='r', label='natural')
-plt.plot(np.array(c_dueling), c='b', label='dueling')
-plt.legend(loc='best')
-plt.ylabel('cost')
-plt.xlabel('training steps')
-plt.grid()
-
-plt.figure(2)
-plt.plot(np.array(r_natural), c='r', label='natural')
-plt.plot(np.array(r_dueling), c='b', label='dueling')
-plt.legend(loc='best')
-plt.ylabel('accumulated reward')
-plt.xlabel('training steps')
-plt.grid()
-
-plt.show()
