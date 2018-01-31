@@ -68,10 +68,10 @@ class PolicyGradient(object):
 
         with tf.variable_scope('loss'):
             # To maximize: R(θ) = Sum(R(τ) * P(τ|θ)).
-            # action_one_hot = tf.one_hot(self.action, self.action_dim)
-            # negative_cross_entropy = tf.reduce_sum(-tf.log(self.action_prob) * action_one_hot, axis=1)
-            negative_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=self.action_value_predict,
-                                                                                    labels=self.action)
+            action_one_hot = tf.one_hot(self.action, self.action_dim)
+            negative_cross_entropy = tf.reduce_sum(-tf.log(self.action_prob) * action_one_hot, axis=1)
+            # negative_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=self.action_value_predict,
+            #                                                                         labels=self.action)
             self.loss = tf.reduce_mean(negative_cross_entropy * self.reward)
 
         with tf.variable_scope('train'):
