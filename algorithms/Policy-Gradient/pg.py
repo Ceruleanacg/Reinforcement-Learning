@@ -73,7 +73,7 @@ class PolicyGradient(object):
             # negative_cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=self.action_value_predict,
             #                                                                         labels=self.action)
             self.loss = tf.reduce_mean(negative_cross_entropy * self.reward)
-
+            # self.loss = tf.reduce_mean(negative_cross_entropy)
         with tf.variable_scope('train'):
             self.train_op = tf.train.AdamOptimizer(self.learning_rate).minimize(self.loss)
 

@@ -54,41 +54,44 @@ class DDPG(object):
         self.reward = tf.placeholder(tf.float32, [None, 1], 'reward')
 
     def _init_nn(self):
-        with tf.variable_scope('predict'):
-            self.a_predict = self.__build_actor_nn(self.state, True)
-            self.q_predict = self.__build_critic(self.state, self.a_predict, True)
-        with tf.variable_scope('next'):
-            self.a_next = self.__build_actor_nn(self.state_next, False)
-            self.q_next = self.__build_critic(self.state_next, self.a_next, False)
+        self.a_predict = self.__build_actor_nn(self.state, "predict/actor", trainable=True)
+        self.a_next = self.__build_actor_nn(self.state_next, "target/actor", trainable=False)
+        self.q_predict = self.__build_critic(self.state, self.a_predict, "predict/critic", trainable=True)
+        self.q_next = self.__build_critic(self.state_next, self.a_next, "target/critic", trainable=False)
 
     def _init_op(self):
 
-        self.a_p_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='predict/actor')
-        self.c_p_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='predict/critic')
+        self.params = []
 
-        self.a_n_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='next/actor')
-        self.c_n_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='next/critic')
+        for scope in ['predict/actor', 'target/actor', 'predict/critic', 'target/critic']:
+            self.params.append(tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=scope))
 
         self.actor_loss = -tf.reduce_mean(self.q_predict)
         self.actor_train_op = tf.train.AdamOptimizer(self.learning_rate).minimize(self.actor_loss,
-                                                                                  var_list=self.a_p_params)
+                                                                                  var_list=self.params[0])
 
         self.q_target = self.reward + self.gamma * self.q_next
-        self.q_loss = tf.losses.mean_squared_error(self.q_target, self.q_predict)
-        self.critic_train_op = tf.train.AdamOptimizer(self.learning_rate * 2).minimize(self.q_loss,
-                                                                                       var_list=self.c_p_params)
+        self.critic_loss = tf.losses.mean_squared_error(self.q_target, self.q_predict)
+        self.critic_train_op = tf.train.AdamOptimizer(self.learning_rate * 2).minimize(self.critic_loss,
+                                                                                       var_list=self.params[2])
 
-        self.update_q_net = [tf.assign(n, self.tau * p + (1 - self.tau) * n) for p, n in zip(self.c_p_params,
-                                                                                             self.c_n_params)]
-        self.update_a_net = [tf.assign(n, self.tau * p + (1 - self.tau) * n) for p, n in zip(self.a_p_params,
-                                                                                             self.a_n_params)]
+        self.update_actor = [tf.assign(t_a, (1 - self.tau) * t_a + self.tau * p_a) for p_a, t_a in zip(self.params[0],
+                                                                                                       self.params[1])]
+
+        self.update_critic = [tf.assign(t_c, (1 - self.tau) * t_c + self.tau * p_c) for p_c, t_c in zip(self.params[2],
+                                                                                                        self.params[3])]
 
         self.session.run(tf.global_variables_initializer())
 
     def train(self):
-        self.session.run([self.update_q_net, self.update_a_net])
+
+        self.session.run([self.update_actor, self.update_critic])
+
         state, action, reward, state_next = self.get_sample_batch()
-        self.session.run(self.actor_train_op, {self.state: state})
+
+        self.session.run(self.actor_train_op, {
+            self.state: state})
+
         self.session.run(self.critic_train_op, {
             self.state: state, self.a_predict: action, self.reward: reward, self.state_next: state_next
         })
@@ -112,11 +115,11 @@ class DDPG(object):
         self.buffer[index, :] = transition
         self.buffer_item_count += 1
 
-    def __build_actor_nn(self, state, trainable):
+    def __build_actor_nn(self, state, scope, trainable=True):
 
         w_init, b_init = tf.random_normal_initializer(.0, .3), tf.constant_initializer(.1)
 
-        with tf.variable_scope('actor'):
+        with tf.variable_scope(scope):
 
             phi_state = tf.layers.dense(state,
                                         30,
@@ -136,15 +139,14 @@ class DDPG(object):
             return tf.multiply(action_prob, self.action_upper_bound)
 
     @staticmethod
-    def __build_critic(state, action, trainable):
+    def __build_critic(state, action, scope, trainable=True):
 
         w_init, b_init = tf.random_normal_initializer(.0, .3), tf.constant_initializer(.1)
 
-        with tf.variable_scope('critic'):
+        with tf.variable_scope(scope):
 
             phi_state = tf.layers.dense(state,
                                         30,
-                                        tf.nn.relu,
                                         kernel_initializer=w_init,
                                         bias_initializer=b_init,
                                         trainable=trainable)
@@ -155,7 +157,7 @@ class DDPG(object):
                                          bias_initializer=b_init,
                                          trainable=trainable)
 
-            q_value = tf.layers.dense((phi_state + phi_action),
+            q_value = tf.layers.dense(tf.nn.relu(phi_state + phi_action),
                                       1,
                                       kernel_initializer=w_init,
                                       bias_initializer=b_init,
@@ -184,7 +186,7 @@ def main(_):
 
         for step in range(200):
 
-            if reward_episode > 300:
+            if reward_episode > -300 and episode > 60:
                 env.render()
 
             action = ddpg.get_next_action(state)
