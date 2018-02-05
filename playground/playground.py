@@ -1,149 +1,187 @@
-"""
-Deep Deterministic Policy Gradient (DDPG), Reinforcement Learning.
-DDPG is Actor Critic based algorithm.
-Pendulum example.
-View more on my tutorial page: https://morvanzhou.github.io/tutorials/
-Using:
-tensorflow 1.0
-gym 0.8.0
-"""
-
+import multiprocessing
+import threading
 import tensorflow as tf
 import numpy as np
 import gym
-import time
+import os
+import shutil
+import matplotlib.pyplot as plt
 
 
-#####################  hyper parameters  ####################
-
-MAX_EPISODES = 200
-MAX_EP_STEPS = 200
+GAME = 'CartPole-v0'
+OUTPUT_GRAPH = True
+LOG_DIR = './log'
+N_WORKERS = multiprocessing.cpu_count()
+MAX_GLOBAL_EP = 1000
+GLOBAL_NET_SCOPE = 'Global_Net'
+UPDATE_GLOBAL_ITER = 10
+GAMMA = 0.9
+ENTROPY_BETA = 0.001
 LR_A = 0.001    # learning rate for actor
-LR_C = 0.002    # learning rate for critic
-GAMMA = 0.9     # reward discount
-TAU = 0.01      # soft replacement
-MEMORY_CAPACITY = 10000
-BATCH_SIZE = 32
+LR_C = 0.001    # learning rate for critic
+GLOBAL_RUNNING_R = []
+GLOBAL_EP = 0
 
-RENDER = False
-ENV_NAME = 'Pendulum-v0'
+env = gym.make(GAME)
+N_S = env.observation_space.shape[0]
+N_A = env.action_space.n
 
-###############################  DDPG  ####################################
 
-class DDPG(object):
-    def __init__(self, a_dim, s_dim, a_bound,):
-        self.memory = np.zeros((MEMORY_CAPACITY, s_dim * 2 + a_dim + 1), dtype=np.float32)
-        self.pointer = 0
-        self.sess = tf.Session()
+class ACNet(object):
+    def __init__(self, scope, globalAC=None):
 
-        self.a_dim, self.s_dim, self.a_bound = a_dim, s_dim, a_bound,
-        self.S = tf.placeholder(tf.float32, [None, s_dim], 's')
-        self.S_ = tf.placeholder(tf.float32, [None, s_dim], 's_')
-        self.R = tf.placeholder(tf.float32, [None, 1], 'r')
+        if scope == GLOBAL_NET_SCOPE:   # get global network
+            with tf.variable_scope(scope):
+                self.s = tf.placeholder(tf.float32, [None, N_S], 'S')
+                self.a_params, self.c_params = self._build_net(scope)[-2:]
+        else:   # local net, calculate losses
+            with tf.variable_scope(scope):
+                self.s = tf.placeholder(tf.float32, [None, N_S], 'S')
+                self.a_his = tf.placeholder(tf.int32, [None, ], 'A')
+                self.v_target = tf.placeholder(tf.float32, [None, 1], 'Vtarget')
 
-        with tf.variable_scope('Actor'):
-            self.a = self._build_a(self.S, scope='eval', trainable=True)
-            a_ = self._build_a(self.S_, scope='target', trainable=False)
-        with tf.variable_scope('Critic'):
-            # assign self.a = a in memory when calculating q for td_error,
-            # otherwise the self.a is from Actor when updating Actor
-            q = self._build_c(self.S, self.a, scope='eval', trainable=True)
-            q_ = self._build_c(self.S_, a_, scope='target', trainable=False)
+                self.a_prob, self.v, self.a_params, self.c_params = self._build_net(scope)
 
-        # networks parameters
-        self.ae_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='Actor/eval')
-        self.at_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='Actor/target')
-        self.ce_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='Critic/eval')
-        self.ct_params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='Critic/target')
+                td = tf.subtract(self.v_target, self.v, name='TD_error')
+                with tf.name_scope('c_loss'):
+                    self.c_loss = tf.reduce_mean(tf.square(td))
 
-        # target net replacement
-        self.soft_replace = [[tf.assign(ta, (1 - TAU) * ta + TAU * ea), tf.assign(tc, (1 - TAU) * tc + TAU * ec)]
-                             for ta, ea, tc, ec in zip(self.at_params, self.ae_params, self.ct_params, self.ce_params)]
+                with tf.name_scope('a_loss'):
+                    log_prob = tf.reduce_sum(tf.log(self.a_prob) * tf.one_hot(self.a_his, N_A, dtype=tf.float32), axis=1, keep_dims=True)
+                    exp_v = log_prob * tf.stop_gradient(td)
+                    entropy = -tf.reduce_sum(self.a_prob * tf.log(self.a_prob + 1e-5),
+                                             axis=1, keep_dims=True)  # encourage exploration
+                    self.exp_v = ENTROPY_BETA * entropy + exp_v
+                    self.a_loss = tf.reduce_mean(-self.exp_v)
 
-        q_target = self.R + GAMMA * q_
-        # in the feed_dic for the td_error, the self.a should change to actions in memory
-        td_error = tf.losses.mean_squared_error(labels=q_target, predictions=q)
-        self.ctrain = tf.train.AdamOptimizer(LR_C).minimize(td_error, var_list=self.ce_params)
+                with tf.name_scope('local_grad'):
+                    self.a_grads = tf.gradients(self.a_loss, self.a_params)
+                    self.c_grads = tf.gradients(self.c_loss, self.c_params)
 
-        a_loss = - tf.reduce_mean(q)    # maximize the q
-        self.atrain = tf.train.AdamOptimizer(LR_A).minimize(a_loss, var_list=self.ae_params)
+            with tf.name_scope('sync'):
+                with tf.name_scope('pull'):
+                    self.pull_a_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.a_params, globalAC.a_params)]
+                    self.pull_c_params_op = [l_p.assign(g_p) for l_p, g_p in zip(self.c_params, globalAC.c_params)]
+                with tf.name_scope('push'):
+                    self.update_a_op = OPT_A.apply_gradients(zip(self.a_grads, globalAC.a_params))
+                    self.update_c_op = OPT_C.apply_gradients(zip(self.c_grads, globalAC.c_params))
 
-        self.sess.run(tf.global_variables_initializer())
+    def _build_net(self, scope):
+        w_init = tf.random_normal_initializer(0., .1)
+        with tf.variable_scope('actor'):
+            l_a = tf.layers.dense(self.s, 200, tf.nn.relu6, kernel_initializer=w_init, name='la')
+            a_prob = tf.layers.dense(l_a, N_A, tf.nn.softmax, kernel_initializer=w_init, name='ap')
+        with tf.variable_scope('critic'):
+            l_c = tf.layers.dense(self.s, 100, tf.nn.relu6, kernel_initializer=w_init, name='lc')
+            v = tf.layers.dense(l_c, 1, kernel_initializer=w_init, name='v')  # state value
+        a_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/actor')
+        c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope + '/critic')
+        return a_prob, v, a_params, c_params
 
-    def choose_action(self, s):
-        return self.sess.run(self.a, {self.S: s[np.newaxis, :]})[0]
+    def update_global(self, feed_dict):  # run by a local
+        SESS.run([self.update_a_op, self.update_c_op], feed_dict)  # local grads applies to global net
 
-    def learn(self):
-        # soft target replacement
-        self.sess.run(self.soft_replace)
+    def pull_global(self):  # run by a local
+        SESS.run([self.pull_a_params_op, self.pull_c_params_op])
 
-        indices = np.random.choice(MEMORY_CAPACITY, size=BATCH_SIZE)
-        bt = self.memory[indices, :]
-        bs = bt[:, :self.s_dim]
-        ba = bt[:, self.s_dim: self.s_dim + self.a_dim]
-        br = bt[:, -self.s_dim - 1: -self.s_dim]
-        bs_ = bt[:, -self.s_dim:]
+    def choose_action(self, s):  # run by a local
+        prob_weights = SESS.run(self.a_prob, feed_dict={self.s: s[np.newaxis, :]})
+        action = np.random.choice(range(prob_weights.shape[1]),
+                                  p=prob_weights.ravel())  # select action w.r.t the actions prob
+        return action
 
-        self.sess.run(self.atrain, {self.S: bs})
-        self.sess.run(self.ctrain, {self.S: bs, self.a: ba, self.R: br, self.S_: bs_})
 
-    def store_transition(self, s, a, r, s_):
-        transition = np.hstack((s, a, [r], s_))
-        index = self.pointer % MEMORY_CAPACITY  # replace the old memory with new memory
-        self.memory[index, :] = transition
-        self.pointer += 1
+class Worker(object):
+    def __init__(self, name, globalAC):
+        self.env = gym.make(GAME).unwrapped
+        self.name = name
+        self.AC = ACNet(name, globalAC)
 
-    def _build_a(self, s, scope, trainable):
-        with tf.variable_scope(scope):
-            net = tf.layers.dense(s, 30, activation=tf.nn.relu, name='l1', trainable=trainable)
-            a = tf.layers.dense(net, self.a_dim, activation=tf.nn.tanh, name='a', trainable=trainable)
-            return tf.multiply(a, self.a_bound, name='scaled_a')
+    def work(self):
+        global GLOBAL_RUNNING_R, GLOBAL_EP
+        total_step = 1
+        buffer_s, buffer_a, buffer_r = [], [], []
+        while not COORD.should_stop() and GLOBAL_EP < MAX_GLOBAL_EP:
+            s = self.env.reset()
+            ep_r = 0
+            while True:
+                # if self.name == 'W_0':
+                #     self.env.render()
+                a = self.AC.choose_action(s)
+                s_, r, done, info = self.env.step(a)
+                if done: r = -5
+                ep_r += r
+                buffer_s.append(s)
+                buffer_a.append(a)
+                buffer_r.append(r)
 
-    def _build_c(self, s, a, scope, trainable):
-        with tf.variable_scope(scope):
-            n_l1 = 30
-            w1_s = tf.get_variable('w1_s', [self.s_dim, n_l1], trainable=trainable)
-            w1_a = tf.get_variable('w1_a', [self.a_dim, n_l1], trainable=trainable)
-            b1 = tf.get_variable('b1', [1, n_l1], trainable=trainable)
-            net = tf.nn.relu(tf.matmul(s, w1_s) + tf.matmul(a, w1_a) + b1)
-            return tf.layers.dense(net, 1, trainable=trainable)  # Q(s,a)
+                if total_step % UPDATE_GLOBAL_ITER == 0 or done:   # update global and assign to local net
+                    if done:
+                        v_s_ = 0   # terminal
+                    else:
+                        v_s_ = SESS.run(self.AC.v, {self.AC.s: s_[np.newaxis, :]})[0, 0]
+                    buffer_v_target = []
+                    for r in buffer_r[::-1]:    # reverse buffer r
+                        v_s_ = r + GAMMA * v_s_
+                        buffer_v_target.append(v_s_)
+                    buffer_v_target.reverse()
 
-###############################  training  ####################################
+                    buffer_s, buffer_a, buffer_v_target = np.vstack(buffer_s), np.array(buffer_a), np.vstack(buffer_v_target)
+                    feed_dict = {
+                        self.AC.s: buffer_s,
+                        self.AC.a_his: buffer_a,
+                        self.AC.v_target: buffer_v_target,
+                    }
+                    self.AC.update_global(feed_dict)
 
-env = gym.make(ENV_NAME)
-env = env.unwrapped
-env.seed(1)
+                    buffer_s, buffer_a, buffer_r = [], [], []
+                    self.AC.pull_global()
 
-s_dim = env.observation_space.shape[0]
-a_dim = env.action_space.shape[0]
-a_bound = env.action_space.high
+                s = s_
+                total_step += 1
+                if done:
+                    if len(GLOBAL_RUNNING_R) == 0:  # record running episode reward
+                        GLOBAL_RUNNING_R.append(ep_r)
+                    else:
+                        GLOBAL_RUNNING_R.append(0.99 * GLOBAL_RUNNING_R[-1] + 0.01 * ep_r)
+                    print(
+                        self.name,
+                        "Ep:", GLOBAL_EP,
+                        "| Ep_r: %i" % GLOBAL_RUNNING_R[-1],
+                          )
+                    GLOBAL_EP += 1
+                    break
 
-ddpg = DDPG(a_dim, s_dim, a_bound)
 
-var = 3  # control exploration
-t1 = time.time()
-for i in range(MAX_EPISODES):
-    s = env.reset()
-    ep_reward = 0
-    for j in range(MAX_EP_STEPS):
-        if RENDER:
-            env.render()
+if __name__ == "__main__":
+    SESS = tf.Session()
 
-        # Add exploration noise
-        a = ddpg.choose_action(s)
-        a = np.clip(np.random.normal(a, var), -2, 2)    # add randomness to action selection for exploration
-        s_, r, done, info = env.step(a)
+    with tf.device("/cpu:0"):
+        OPT_A = tf.train.RMSPropOptimizer(LR_A, name='RMSPropA')
+        OPT_C = tf.train.RMSPropOptimizer(LR_C, name='RMSPropC')
+        GLOBAL_AC = ACNet(GLOBAL_NET_SCOPE)  # we only need its params
+        workers = []
+        # Create worker
+        for i in range(N_WORKERS):
+            i_name = 'W_%i' % i   # worker name
+            workers.append(Worker(i_name, GLOBAL_AC))
 
-        ddpg.store_transition(s, a, r / 10, s_)
+    COORD = tf.train.Coordinator()
+    SESS.run(tf.global_variables_initializer())
 
-        if ddpg.pointer > MEMORY_CAPACITY:
-            var *= .9995    # decay the action randomness
-            ddpg.learn()
+    if OUTPUT_GRAPH:
+        if os.path.exists(LOG_DIR):
+            shutil.rmtree(LOG_DIR)
+        tf.summary.FileWriter(LOG_DIR, SESS.graph)
 
-        s = s_
-        ep_reward += r
-        if j == MAX_EP_STEPS-1:
-            print('Episode:', i, ' Reward: %i' % int(ep_reward), 'Explore: %.2f' % var, )
-            # if ep_reward > -300:RENDER = True
-            break
-print('Running time: ', time.time() - t1)
+    worker_threads = []
+    for worker in workers:
+        job = lambda: worker.work()
+        t = threading.Thread(target=job)
+        t.start()
+        worker_threads.append(t)
+    COORD.join(worker_threads)
+
+    plt.plot(np.arange(len(GLOBAL_RUNNING_R)), GLOBAL_RUNNING_R)
+    plt.xlabel('step')
+    plt.ylabel('Total moving reward')
