@@ -9,21 +9,25 @@ import shutil
 import gym
 import os
 
+from helpers import json_helper
 
+
+CKP_DIR = './checkpoint/'
+LOG_DIR = './logs'
 ENV_NAME = "CartPole-v0"
 GLOBAL_ENV = gym.make(ENV_NAME)
 
 STATE_SPACE, ACTION_SPACE = GLOBAL_ENV.observation_space.shape[0], GLOBAL_ENV.action_space.n
 
 GLOBAL_EPISODE = 0
-GLOBAL_EPISODE_MAX = 1000
+GLOBAL_EPISODE_MAX = 500
 GLOBAL_RUNNING_REWARD = []
 GLOBAL_UPDATE_ITERATION = 10
 
 
 class A3C(object):
 
-    def __init__(self, session, state_space, action_space, scope, master_model=None):
+    def __init__(self, session, state_space, action_space, scope, master_model=None, **options):
 
         self.session = session
 
@@ -33,6 +37,16 @@ class A3C(object):
         self.master_model = master_model
 
         self.scope = scope
+
+        try:
+            self.actor_learning_rate = options['actor_learning_rate']
+        except KeyError:
+            self.actor_learning_rate = 0.001
+
+        try:
+            self.critic_learning_rate = options['critic_learning_rate']
+        except KeyError:
+            self.critic_learning_rate = 0.002
 
         with tf.variable_scope(self.scope):
             self._init_input()
@@ -79,15 +93,13 @@ class A3C(object):
         self.critic_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.scope + '/critic')
 
     def _init_op(self):
-
         if self.scope == 'master':
-
-            self.actor_optimizer = tf.train.RMSPropOptimizer(0.001)
-            self.critic_optimizer = tf.train.RMSPropOptimizer(0.002)
-
+            with tf.variable_scope('optimizer'):
+                self.actor_optimizer = tf.train.RMSPropOptimizer(self.actor_learning_rate)
+                self.critic_optimizer = tf.train.RMSPropOptimizer(self.critic_learning_rate)
         else:
-
-            self.td_error = tf.subtract(self.q_target, self.q_predict)
+            with tf.variable_scope('td_error'):
+                self.td_error = tf.subtract(self.q_target, self.q_predict)
 
             with tf.variable_scope('critic_loss'):
                 self.critic_loss = tf.reduce_mean(tf.square(self.td_error))
@@ -101,15 +113,13 @@ class A3C(object):
                 self.actor_gradients = tf.gradients(self.actor_loss, self.actor_params)
                 self.critic_gradients = tf.gradients(self.critic_loss, self.critic_params)
 
-            with tf.variable_scope('sync_pull'):
+            with tf.variable_scope('pull'):
+                zipped_actor_vars = zip(self.master_model.actor_params, self.actor_params)
+                zipped_critic_vars = zip(self.master_model.critic_params, self.critic_params)
+                self.pull_actor_params_op = [l_a_p.assign(g_a_p) for g_a_p, l_a_p in zipped_actor_vars]
+                self.pull_critic_params_op = [l_c_p.assign(g_c_p) for g_c_p, l_c_p in zipped_critic_vars]
 
-                zipped_actor_params = zip(self.master_model.actor_params, self.actor_params)
-                zipped_critic_params = zip(self.master_model.critic_params, self.critic_params)
-
-                self.pull_actor_params_op = [l_a_p.assign(g_a_p) for g_a_p, l_a_p in zipped_actor_params]
-                self.pull_critic_params_op = [l_c_p.assign(g_c_p) for g_c_p, l_c_p in zipped_critic_params]
-
-            with tf.variable_scope('sync_push'):
+            with tf.variable_scope('push'):
                 zipped_actor_vars = zip(self.actor_gradients, self.master_model.actor_params)
                 zipped_critic_vars = zip(self.critic_gradients, self.master_model.critic_params)
                 self.update_actor_op = self.master_model.actor_optimizer.apply_gradients(zipped_actor_vars)
@@ -129,82 +139,85 @@ class A3C(object):
 
 class Worker(object):
 
-    def __init__(self, session, name, coordinator, master_model):
-        self.env = gym.make(ENV_NAME).unwrapped
+    def __init__(self, env, session, name, coordinator, master_model):
+
+        self.env = env
         self.name = name
         self.model = A3C(session, STATE_SPACE, ACTION_SPACE, 'slave-' + name, master_model=master_model)
         self.session = session
         self.coordinator = coordinator
         self.master_model = master_model
 
+        self.buffer_action = []
+        self.buffer_state = []
+        self.buffer_reward = []
+        self.buffer_q_target = []
+        self.total_steps = 1
+
     def work(self):
-
-        global GLOBAL_EPISODE
-
-        buffer_action, buffer_state, buffer_reward, total_steps = [], [], [], 1
 
         while not self.coordinator.should_stop() and GLOBAL_EPISODE < GLOBAL_EPISODE_MAX:
 
-            state = self.env.reset()
-
-            reward_episode = 0
+            state, reward_episode = self.env.reset(), 0
 
             while True:
 
                 action = self.model.get_next_action(state)
-
                 state_next, reward, done, info = self.env.step(action)
-
-                if done:
-                    reward = -5
-
+                reward = -5 if done else reward
                 reward_episode += reward
 
-                buffer_action.append(action)
-                buffer_reward.append(reward)
-                buffer_state.append(state)
+                self.buffer_action.append(action)
+                self.buffer_reward.append(reward)
+                self.buffer_state.append(state)
 
-                if total_steps % GLOBAL_UPDATE_ITERATION == 0 or done:
-
-                    if done:
-                        q_target = 0
-                    else:
-                        q_target = self.session.run(self.model.q_predict, {self.model.state: state_next[np.newaxis, :]})[0, 0]
-
-                    buffer_q_target = []
-
-                    for reward in buffer_reward[::-1]:
-                        q_target = reward + 0.9 * q_target
-                        buffer_q_target.append(q_target)
-
-                    buffer_q_target.reverse()
-
-                    feed_dict = {
-                        self.model.state: np.vstack(buffer_state),
-                        self.model.action: np.array(buffer_action),
-                        self.model.q_target: np.vstack(buffer_q_target)
-                    }
-
-                    self.model.update_master_nn(feed_dict)
-
-                    buffer_action, buffer_state, buffer_reward = [], [], []
-
-                    self.model.pull_master_nn()
+                if self.total_steps % GLOBAL_UPDATE_ITERATION == 0 or done:
+                    self.train(state_next, done)
 
                 state = state_next
 
-                total_steps += 1
+                self.total_steps += 1
 
                 if done:
-                    if len(GLOBAL_RUNNING_REWARD) == 0:
-                        GLOBAL_RUNNING_REWARD.append(reward_episode)
-                    else:
-                        GLOBAL_RUNNING_REWARD.append(0.99 * GLOBAL_RUNNING_REWARD[-1] + 0.01 * reward_episode)
-                    print("Worker Name: {}| Episode: {}, Rewards: {}".format(self.name,
-                                                                             GLOBAL_EPISODE,
-                                                                             GLOBAL_RUNNING_REWARD[-1]))
-                    GLOBAL_EPISODE += 1
+                    self.update_running_reward(reward_episode)
                     break
+
+    def train(self, state_next, done):
+
+        if done:
+            q_target = 0
+        else:
+            q_target = self.session.run(self.model.q_predict, {self.model.state: state_next[np.newaxis, :]})[0][0]
+
+        for reward in self.buffer_reward[::-1]:
+            q_target = reward + 0.9 * q_target
+            self.buffer_q_target.append(q_target)
+
+        self.buffer_q_target.reverse()
+
+        feed_dict = {
+            self.model.state: np.vstack(self.buffer_state),
+            self.model.action: np.array(self.buffer_action),
+            self.model.q_target: np.vstack(self.buffer_q_target)
+        }
+
+        self.model.update_master_nn(feed_dict)
+        self.model.pull_master_nn()
+
+        self.buffer_action, self.buffer_state, self.buffer_reward, self.buffer_q_target = [], [], [], []
+
+    def update_running_reward(self, reward_episode):
+        global GLOBAL_EPISODE
+        if len(GLOBAL_RUNNING_REWARD) == 0:
+            GLOBAL_RUNNING_REWARD.append(reward_episode)
+        else:
+            GLOBAL_RUNNING_REWARD.append(0.99 * GLOBAL_RUNNING_REWARD[-1] + 0.01 * reward_episode)
+
+        if GLOBAL_EPISODE % 50 == 0:
+            print("Thread: {0}| Episode: {1}, Rewards: {2:.2f}".format(self.name,
+                                                                       GLOBAL_EPISODE,
+                                                                       reward_episode))
+        GLOBAL_EPISODE += 1
 
 
 def main(_):
@@ -213,11 +226,13 @@ def main(_):
 
     master_model = A3C(session, STATE_SPACE, ACTION_SPACE, "master")
 
-    workers, coordinator = [], tf.train.Coordinator()
+    workers, coordinator, env_list = [], tf.train.Coordinator(), []
 
     # for index in range(1):
     for index in range(multiprocessing.cpu_count()):
-        workers.append(Worker(session, "{}".format(index), coordinator, master_model))
+        env = gym.make(ENV_NAME).unwrapped
+        workers.append(Worker(env, session, "{}".format(index), coordinator, master_model))
+        env_list.append(env)
 
     session.run(tf.global_variables_initializer())
 
@@ -228,7 +243,27 @@ def main(_):
         thread.start()
         worker_threads.append(thread)
 
+    # while GLOBAL_EPISODE < GLOBAL_EPISODE_MAX:
+    #     for env in env_list:
+    #         env.render()
+
     coordinator.join(worker_threads)
+
+    if os.path.exists(LOG_DIR):
+        shutil.rmtree(LOG_DIR)
+
+    tf.summary.FileWriter(LOG_DIR, session.graph)
+
+    saver = tf.train.Saver()
+    saver.save(session, CKP_DIR)
+
+    json_helper.save_json(GLOBAL_RUNNING_REWARD, './data/rewards.json')
+
+    plt.plot(np.arange(len(GLOBAL_RUNNING_REWARD)), GLOBAL_RUNNING_REWARD)
+    plt.title('A3C on CartPole')
+    plt.xlabel('Step')
+    plt.ylabel('Total Reward')
+    plt.show()
 
 
 if __name__ == '__main__':

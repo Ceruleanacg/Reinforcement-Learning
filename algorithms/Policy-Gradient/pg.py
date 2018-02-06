@@ -5,6 +5,8 @@ import tensorflow as tf
 import numpy as np
 import gym
 
+from helpers import json_helper
+
 np.random.seed(1)
 tf.set_random_seed(1)
 
@@ -16,7 +18,7 @@ class PolicyGradient(object):
         try:
             self.learning_rate = options['learning_rate']
         except KeyError:
-            self.learning_rate = 0.02
+            self.learning_rate = 0.002
 
         try:
             self.gamma = options['gamma']
@@ -109,13 +111,11 @@ class PolicyGradient(object):
         })
 
         self.train_steps += 1
-
-        print("Train steps: {} | The loss is: {}".format(self.train_steps, loss))
-
         self.s_buffer, self.a_buffer, self.r_buffer = [], [], []
 
 
 def run():
+
     env = gym.make('CartPole-v0')
     env.seed(1)
     env = env.unwrapped
@@ -124,22 +124,30 @@ def run():
 
     running_reward_sum = None
 
-    for episode in range(3000):
+    running_reward_list = []
 
-        state = env.reset()
+    for episode in range(500):
+
+        state, reward_episode = env.reset(), 0
 
         while True:
 
-            if episode > 80:
-                env.render()
+            # if episode > 80:
+            #     env.render()
 
             action = model.get_next_action(state)
 
             state_next, reward, done, info = env.step(action)
 
+            if done:
+                reward = -5
+
+            reward_episode += reward
+
             model.save_transition(state, action, reward)
 
             if done:
+
                 if running_reward_sum is None:
                     running_reward_sum = sum(model.r_buffer)
                 else:
@@ -147,9 +155,22 @@ def run():
 
                 model.train()
 
+                running_reward_list.append(running_reward_sum)
+
+                if episode % 50 == 0:
+                    print("Episode: {} | Reward is: {}".format(episode, reward_episode))
+
                 break
 
             state = state_next
+
+    json_helper.save_json(running_reward_list, './data/rewards.json')
+
+    plt.plot(np.arange(len(running_reward_list)), running_reward_list)
+    plt.title('Actor Only on CartPole')
+    plt.xlabel('Step')
+    plt.ylabel('Total Reward')
+    plt.show()
 
 
 if __name__ == '__main__':
